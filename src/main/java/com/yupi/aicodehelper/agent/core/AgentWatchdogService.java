@@ -31,6 +31,8 @@ public class AgentWatchdogService {
                 continue;
             }
             slot.markFailed("Heartbeat timeout: no heartbeat for over " + HEARTBEAT_TIMEOUT_SECONDS + " seconds");
+            runtimeTaskService.pushNotification(slot.getRuntimeId(), "timeout",
+                    "task timed out after " + HEARTBEAT_TIMEOUT_SECONDS + "s");
             agentTaskRepository.findByTaskId(slot.getTaskId()).ifPresent(task -> {
                 if ("RUNNING".equals(task.getStatus())) {
                     task.setStatus("FAILED");

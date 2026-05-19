@@ -458,12 +458,12 @@ class AgentLoopServiceTest {
         assertThat(state.finalAnswer()).isEqualTo("Recovered from tool error.");
         assertThat(state.messages())
                 .extracting(AgentMessage::content)
-                .anySatisfy(content -> assertThat(content).contains("tool_error", "temporary failure"));
+                .anySatisfy(content -> assertThat(content).contains("parameter_error", "temporary failure"));
         assertThat(events)
                 .filteredOn(event -> event.type() == AgentHookEventType.ON_RECOVERY)
                 .anySatisfy(event -> {
                     assertThat(event.toolName()).isEqualTo("unstableTool");
-                    assertThat(event.payload()).containsEntry("type", AgentRecoveryType.TOOL_ERROR);
+                    assertThat(event.payload()).containsEntry("type", AgentRecoveryType.PARAMETER);
                 });
     }
 
@@ -522,7 +522,7 @@ class AgentLoopServiceTest {
                             """;
                 },
                 AgentLoopObserver.NOOP,
-                8
+                5
         );
 
         assertThat(state.finalAnswer()).isEqualTo("Task #2 is unblocked and ready.");

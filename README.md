@@ -6,22 +6,24 @@ A Spring Boot + Vue full-stack project that combines traditional backend enginee
 
 ## Why This Project
 
-Most "AI projects" in resumes are thin wrappers around an API call. This one is different: **the Agent Runtime is the product**. It implements a full ReAct loop with tool permission gating, three-tier context compaction, structured error recovery, sub-agent isolation, and execution trace streaming — all written from scratch on top of LangChain4j as the model transport layer.
+Most "AI projects" in resumes are thin wrappers around an API call. This one is different: **the Agent Runtime is the product**. It implements a full ReAct loop with tool permission gating, execution planning and validation, three-tier context compaction, tiered tool recovery, idempotent tool execution, sub-agent isolation, and execution trace streaming — all written from scratch on top of LangChain4j as the model transport layer.
 
 ## Technical Highlights
 
 ### Agent Runtime (self-built ReAct engine)
 
 - **Custom ReAct loop**: `model turn → tool_use → tool_result → next turn → final_answer`, up to 8 autonomous turns. LangChain4j is used only as the LLM client — all orchestration logic is purpose-built.
+- **Plan-before-act stage**: before long autonomous runs, the Agent asks the model for a structured JSON execution plan, validates step order, tool existence, and tool-using coverage, and asks for a corrected plan when validation fails. The validated plan is rendered back into later prompts so the ReAct loop has an explicit execution contract.
 - **Three-tier context compaction** inspired by Claude Code: Tier 1 scores and removes low-value old messages (Snip), Tier 2 trims large JSON tool outputs to essential fields (Microcompact), Tier 3 calls the model to produce a structured semantic summary that replaces the entire conversation (Autocompact). Each tier gates the next — lightweight operations stay in-process, expensive ones run only when needed.
 - **Tool permission gate** with four levels: `READ`, `WRITE`, `EXTERNAL`, `SENSITIVE`. Denied calls return structured `tool_result` errors instead of throwing exceptions, so the model can adapt its strategy rather than crashing the loop.
-- **Structured error recovery** for four failure modes: invalid model output JSON, unknown tool names, tool execution exceptions, and max-turn limits. Each has a specific recovery message format that the model can self-correct against.
-- **Hook system with events** for model turns, tool calls, permission denial, compaction, and recovery. Observers receive these events to persist steps, update heartbeats, and push SSE streams — all without coupling business logic to the loop.
+- **Tool idempotency guard**: Redis-backed SHA-256 hashes of tool name + canonical input detect duplicate calls within a 10-minute TTL and replay cached results, reducing repeated writes and duplicate external operations during retries.
+- **Three-tier tool recovery**: transient failures are retried automatically, parameter/model-output failures are returned as structured correction prompts, and semantic failures trigger a replan path. Unknown tools, malformed JSON, tool exceptions, and max-turn exits all emit typed recovery decisions.
+- **Hook system with events** for model turns, tool calls, permission denial, compaction, plan validation, replan, and recovery. Observers receive these events to persist steps, update heartbeats, and push SSE streams — all without coupling business logic to the loop.
 
 ### AI Integration
 
 - **MCP dual-channel routing**: the same MCP external tools (e.g. DashScope WebSearch) are routed into both the streaming chat path (via LangChain4j's native `McpToolProvider`) and the Agent tool registry (dynamically registered as `mcp_*` tools with `EXTERNAL` permission). `ObjectProvider<McpClient>` makes MCP optional — when not configured, external tools are silently skipped.
-- **Explainable RAG**: local retrieval loads Hot100 markdown and JSON resources, splits them into section-level chunks enriched with slug, difficulty, tags, and pattern metadata. Returns scored results with matched terms — deterministic and debuggable, not a black-box vector search.
+- **Hybrid explainable RAG**: local retrieval loads Hot100 markdown and JSON resources, splits them into section-level chunks enriched with slug, difficulty, tags, and pattern metadata, then merges Redis-backed vector similarity with deterministic keyword scoring through `HybridRanker`. Results include scores, matched terms, and content windows, so retrieval is debuggable rather than a black box.
 - **Agent step-level SSE streaming**: unlike chat token streaming (which LangChain4j handles natively), this streams Agent execution events (`model_turn`, `tool_result`, `tool_error`, `finish`) in real time. Uses Reactor `Sinks.Many` to bridge the blocking Agent loop to a reactive SSE flux.
 
 ### Long-Term Memory System
@@ -97,16 +99,19 @@ The Hot100 Agent can launch focused background work without blocking the current
 
 `AgentKnowledgeService` provides the Agent's `retrieveKnowledge` tool.
 
-The current retrieval baseline:
+The current retrieval pipeline:
 
 - loads `src/main/resources/hot100/markdown/*.md`
 - loads `src/main/resources/hot100/json/*.json`
 - splits markdown into section-level chunks
 - enriches chunks with problem metadata such as slug, title, difficulty, tags, pattern, and summary
+- optionally ingests docs and Hot100 notes into LangChain4j embeddings
+- persists embedding vectors in Redis through `RedisEmbeddingStore` so cold starts can reuse the index
+- queries both the in-memory `ContentRetriever` path and Redis vector store when available
+- reranks candidates with `HybridRanker`, using 60% vector score and 40% normalized keyword score
 - returns explainable retrieval fields: source, slug, title, section, score, matched terms, and content
-- keeps LangChain4j `ContentRetriever` as an optional extension point for vector retrieval
 
-This gives the project a deterministic local RAG path for tests and demos, while leaving room for embedding-based search.
+This gives the project a deterministic local RAG path for tests and demos, while supporting embedding-based semantic search when RAG is enabled.
 
 ## MCP Integration
 
@@ -168,6 +173,12 @@ Three-tier strategy — lightweight operations first, expensive model calls only
 | TIER3_AUTOCOMPACT | Model-generated structured summary (`goal`, `done`, `findings`, `remaining`) replacing all messages | Network I/O + tokens |
 
 Tiers 1 and 2 directly mutate the message list without calling `state.compact()`. Only Tier 3 calls `state.compact()`, which clears all messages and replaces them with the original goal + the model's summary.
+
+## Planning, Idempotency, and Recovery
+
+- **Planning**: `AgentPlanValidator` accepts at most 8 plan steps, verifies step order, rejects unknown tool names, and requires at least one tool-using step for data-backed work. Invalid plans are sent back to the model for one correction attempt before the Agent proceeds.
+- **Idempotency**: `ToolIdempotencyGuard` hashes tool calls by name and sorted JSON input, stores successful outputs in Redis for 10 minutes, and returns `_idempotent=true` cached results for duplicate calls.
+- **Tiered recovery**: `AgentRecoveryPolicy` classifies errors into `TRANSIENT`, `PARAMETER`, and `SEMANTIC`. Transient errors retry the same call, parameter errors ask the model to fix input/output shape, and semantic errors clear the current plan and emit a replan event.
 
 ## Main APIs
 
@@ -280,7 +291,7 @@ npm run build
 
 Built a full-stack AI learning assistant (Spring Boot + Vue) with a self-built ReAct Agent Runtime for algorithm coaching. The backend implements JWT authentication, Hot100 learning workflows (progress tracking, wrong-answer analysis, weak-tag analytics, recommendations, study plans), streaming AI chat, and a custom Agent execution engine.
 
-The Agent Runtime is the core differentiator: a multi-turn ReAct loop with four-level tool permission gating, three-tier context compaction (inspired by Claude Code), structured error recovery, hook-based observability, long-term memory, sub-agent isolation, and SSE event streaming. LangChain4j is used as the model transport layer — all orchestration logic is purpose-built. Tool execution is fully observable through persistent step traces and a merged runtime timeline.
+The Agent Runtime is the core differentiator: a multi-turn ReAct loop with four-level tool permission gating, plan generation and validation, Redis-backed tool idempotency, three-tier context compaction (inspired by Claude Code), three-tier tool recovery, hook-based observability, long-term memory, sub-agent isolation, and SSE event streaming. LangChain4j is used as the model transport layer — all orchestration logic is purpose-built. Tool execution is fully observable through persistent step traces and a merged runtime timeline.
 
 ## Project Structure
 

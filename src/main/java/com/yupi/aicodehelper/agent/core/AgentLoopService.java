@@ -3,7 +3,9 @@ package com.yupi.aicodehelper.agent.core;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.util.LinkedHashMap;
@@ -39,17 +41,20 @@ public class AgentLoopService {
     private final AgentPromptBuilder promptBuilder;
     private final AgentRecoveryPolicy recoveryPolicy;
     private final TaskGraphService taskGraphService;
+    private final RuntimeTaskService runtimeTaskService;
+    private final AgentPlanValidator planValidator;
+    private final ToolIdempotencyGuard idempotencyGuard;
 
     public AgentLoopService(ObjectMapper objectMapper) {
         this(objectMapper, SkillCatalogService.of(Map.of()), new AgentPermissionGate(), new AgentHookManager(),
                 new AgentPromptBuilder(objectMapper), new AgentRecoveryPolicy(),
-                new TaskGraphService(new InMemoryTaskBoard()));
+                new TaskGraphService(new InMemoryTaskBoard()), null, new AgentPlanValidator(), null);
     }
 
     public AgentLoopService(ObjectMapper objectMapper, SkillCatalogService skillCatalogService) {
         this(objectMapper, skillCatalogService, new AgentPermissionGate(), new AgentHookManager(),
                 new AgentPromptBuilder(objectMapper), new AgentRecoveryPolicy(),
-                new TaskGraphService(new InMemoryTaskBoard()));
+                new TaskGraphService(new InMemoryTaskBoard()), null, new AgentPlanValidator(), null);
     }
 
     public AgentLoopService(ObjectMapper objectMapper,
@@ -57,7 +62,7 @@ public class AgentLoopService {
                             AgentPermissionGate permissionGate) {
         this(objectMapper, skillCatalogService, permissionGate, new AgentHookManager(),
                 new AgentPromptBuilder(objectMapper), new AgentRecoveryPolicy(),
-                new TaskGraphService(new InMemoryTaskBoard()));
+                new TaskGraphService(new InMemoryTaskBoard()), null, new AgentPlanValidator(), null);
     }
 
     public AgentLoopService(ObjectMapper objectMapper,
@@ -65,7 +70,8 @@ public class AgentLoopService {
                             AgentPermissionGate permissionGate,
                             AgentHookManager hookManager) {
         this(objectMapper, skillCatalogService, permissionGate, hookManager, new AgentPromptBuilder(objectMapper),
-                new AgentRecoveryPolicy(), new TaskGraphService(new InMemoryTaskBoard()));
+                new AgentRecoveryPolicy(), new TaskGraphService(new InMemoryTaskBoard()), null,
+                new AgentPlanValidator(), null);
     }
 
     @Autowired
@@ -75,9 +81,14 @@ public class AgentLoopService {
                             AgentHookManager hookManager,
                             AgentPromptBuilder promptBuilder,
                             AgentRecoveryPolicy recoveryPolicy,
-                            TaskBoard taskBoard) {
+                            TaskBoard taskBoard,
+                            ObjectProvider<RuntimeTaskService> runtimeTaskServiceProvider,
+                            ObjectProvider<StringRedisTemplate> stringRedisTemplateProvider) {
         this(objectMapper, skillCatalogService, permissionGate, hookManager, promptBuilder, recoveryPolicy,
-                new TaskGraphService(taskBoard));
+                new TaskGraphService(taskBoard),
+                runtimeTaskServiceProvider.getIfAvailable(),
+                new AgentPlanValidator(),
+                new ToolIdempotencyGuard(stringRedisTemplateProvider.getIfAvailable(), objectMapper));
     }
 
     public AgentLoopService(ObjectMapper objectMapper,
@@ -86,7 +97,10 @@ public class AgentLoopService {
                             AgentHookManager hookManager,
                             AgentPromptBuilder promptBuilder,
                             AgentRecoveryPolicy recoveryPolicy,
-                            TaskGraphService taskGraphService) {
+                            TaskGraphService taskGraphService,
+                            RuntimeTaskService runtimeTaskService,
+                            AgentPlanValidator planValidator,
+                            ToolIdempotencyGuard idempotencyGuard) {
         this.objectMapper = objectMapper;
         this.skillCatalogService = skillCatalogService;
         this.permissionGate = permissionGate;
@@ -94,6 +108,9 @@ public class AgentLoopService {
         this.promptBuilder = promptBuilder;
         this.recoveryPolicy = recoveryPolicy;
         this.taskGraphService = taskGraphService;
+        this.runtimeTaskService = runtimeTaskService;
+        this.planValidator = planValidator;
+        this.idempotencyGuard = idempotencyGuard;
     }
 
     public AgentLoopState run(String userGoal,
@@ -131,8 +148,13 @@ public class AgentLoopService {
         registerTaskTools(toolRegistry);
         AgentLoopObserver safeObserver = observer == null ? AgentLoopObserver.NOOP : observer;
 
+        if (maxTurns >= DEFAULT_MAX_TURNS) {
+            runPlanStage(state, toolRegistry, turnClient, safeObserver);
+        }
+
         while (!state.finished() && state.turnCount() < maxTurns) {
             state.incrementTurnCount();
+            drainBackgroundNotifications(state);
             compactIfNeeded(state, turnClient);
             String prompt = promptBuilder.build(new AgentPromptContext(state, toolRegistry));
             publishHook(AgentHookEventType.BEFORE_MODEL_TURN, state.turnCount(), null, Map.of(
@@ -197,8 +219,21 @@ public class AgentLoopService {
                 state.transitionReason("tool_result");
                 continue;
             }
+            // Idempotency check: skip duplicate tool calls within TTL window
+            if (idempotencyGuard != null && idempotencyGuard.isDuplicate(toolUse.name(), toolUse.input())) {
+                String cached = idempotencyGuard.getCachedResult(toolUse.name(), toolUse.input());
+                if (cached != null) {
+                    appendToolResult(state, toolUse, Map.of(
+                            "_idempotent", true,
+                            "cachedResult", cached
+                    ));
+                    state.transitionReason("tool_result");
+                    continue;
+                }
+            }
             try {
-                Object output = tool.handler().handle(toolUse.input());
+                Object output = executeWithRetry(toolUse, tool, state, safeObserver, toolStartedAt);
+                if (output == null) continue; // retry/semantic recovery already handled
                 long toolLatencyMs = System.currentTimeMillis() - toolStartedAt;
                 safeObserver.onToolResult(state.turnCount(), toolUse.name(), toolUse.input(), output,
                         toolLatencyMs);
@@ -208,6 +243,9 @@ public class AgentLoopService {
                         "latencyMs", toolLatencyMs
                 ));
                 appendToolResult(state, toolUse, output);
+                if (idempotencyGuard != null) {
+                    idempotencyGuard.markExecuted(toolUse.name(), toolUse.input(), output);
+                }
             } catch (Exception e) {
                 long toolLatencyMs = System.currentTimeMillis() - toolStartedAt;
                 safeObserver.onToolError(state.turnCount(), toolUse.name(), toolUse.input(), e,
@@ -217,11 +255,107 @@ public class AgentLoopService {
                         "error", blankToPlaceholder(e.getMessage()),
                         "latencyMs", toolLatencyMs
                 ));
-                applyToolRecovery(state, toolUse, recoveryPolicy.toolError(toolUse, e));
+                AgentRecoveryDecision recoveryDecision = recoveryPolicy.toolError(toolUse, e);
+                applyTieredRecovery(state, toolUse, recoveryDecision);
             }
             state.transitionReason("tool_result");
         }
 
+        return finalizeState(state, maxTurns);
+    }
+
+    private void runPlanStage(AgentLoopState state, AgentToolRegistry toolRegistry,
+                              AgentTurnClient turnClient, AgentLoopObserver safeObserver) {
+        for (int attempt = 1; attempt <= planValidator.maxAttempts(); attempt++) {
+            String planPrompt = buildPlanPrompt(state, toolRegistry);
+            String planOutput = turnClient.nextTurn(planPrompt);
+            List<PlanStep> steps = parsePlan(planOutput);
+
+            AgentPlanValidator.PlanValidationResult result = planValidator.validate(steps, toolRegistry);
+            if (result.valid()) {
+                state.setPlan(result.steps());
+                state.messages().add(new AgentMessage("assistant",
+                        "[Plan validated — %d steps]\n%s".formatted(result.steps().size(),
+                                planOutput)));
+                publishHook(AgentHookEventType.ON_PLAN_VALIDATED, 0, null, Map.of(
+                        "steps", result.steps().size(),
+                        "attempt", attempt
+                ));
+                return;
+            }
+
+            if (attempt < planValidator.maxAttempts()) {
+                state.messages().add(new AgentMessage("user", result.toReplanPrompt()));
+            } else {
+                state.setPlan(result.steps().isEmpty() ? List.of() : result.steps());
+                state.messages().add(new AgentMessage("assistant",
+                        "[Plan validation failed after %d attempts — proceeding with ReAct loop]\nIssues: %s"
+                                .formatted(attempt, String.join("; ", result.issues()))));
+                publishHook(AgentHookEventType.ON_PLAN_FAILED, 0, null, Map.of(
+                        "attempts", attempt,
+                        "issues", result.issues().size()
+                ));
+            }
+        }
+    }
+
+    private String buildPlanPrompt(AgentLoopState state, AgentToolRegistry toolRegistry) {
+        return """
+                You are a planning agent. Before executing any work, produce a step-by-step execution plan.
+
+                User goal:
+                %s
+
+                Available tools:
+                %s
+
+                Output format (JSON only):
+                {"type":"plan","steps":[
+                  {"action":"what to do","toolName":"tool_or_empty","rationale":"why","order":0},
+                  {"action":"next step","toolName":"another_tool","rationale":"why","order":1}
+                ]}
+
+                Rules:
+                - Each step must have a clear action description.
+                - If a step needs data, use a tool (set toolName to the exact tool name from Available tools).
+                - If a step is reasoning/analysis only, leave toolName empty.
+                - order must be 0,1,2,... in sequence.
+                - At least one step must use a tool.
+                - Maximum 8 steps.
+                - Think step-by-step: first gather data, then analyze, then answer.
+                """.formatted(
+                state.messages().isEmpty() ? "unknown" : state.messages().get(0).content(),
+                toolRegistry.describeAvailableTools()
+        );
+    }
+
+    private List<PlanStep> parsePlan(String modelOutput) {
+        try {
+            String json = extractJsonObject(modelOutput);
+            JsonNode root = objectMapper.readTree(json);
+            if (!"plan".equals(root.path("type").asText(""))) {
+                return List.of();
+            }
+            JsonNode stepsNode = root.path("steps");
+            if (!stepsNode.isArray()) {
+                return List.of();
+            }
+            List<PlanStep> steps = new ArrayList<>();
+            for (JsonNode step : stepsNode) {
+                steps.add(new PlanStep(
+                        step.path("action").asText(""),
+                        step.path("toolName").asText(""),
+                        step.path("rationale").asText(""),
+                        step.path("order").asInt(steps.size())
+                ));
+            }
+            return steps;
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
+    private AgentLoopState finalizeState(AgentLoopState state, int maxTurns) {
         if (!state.finished()) {
             AgentRecoveryDecision recoveryDecision = recoveryPolicy.maxTurns(maxTurns);
             publishRecoveryHook(state.turnCount(), null, recoveryDecision);
@@ -284,6 +418,22 @@ public class AgentLoopService {
                 })
                 .register("task_list", "List persistent tasks. Input: optional includeDeleted.", input ->
                         taskGraphService.list(booleanArg(input, "includeDeleted", false)));
+    }
+
+    private void drainBackgroundNotifications(AgentLoopState state) {
+        if (runtimeTaskService == null) {
+            return;
+        }
+        List<BackgroundNotification> notifications = runtimeTaskService.drainNotifications();
+        if (notifications.isEmpty()) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder("[Background notifications]\n");
+        for (BackgroundNotification n : notifications) {
+            sb.append("- [").append(n.taskId()).append("] ")
+                    .append(n.status()).append(": ").append(n.preview()).append("\n");
+        }
+        state.messages().add(new AgentMessage("user", sb.toString().trim()));
     }
 
     private void compactIfNeeded(AgentLoopState state, AgentTurnClient turnClient) {
@@ -662,6 +812,78 @@ public class AgentLoopService {
         publishRecoveryHook(state.turnCount(), toolUse.name(), recoveryDecision);
         appendToolResult(state, toolUse, recoveryDecision.content());
         state.transitionReason("tool_result");
+    }
+
+    private Object executeWithRetry(ToolUseBlock toolUse, RegisteredAgentTool tool,
+                                    AgentLoopState state, AgentLoopObserver safeObserver,
+                                    long toolStartedAt) throws Exception {
+        Exception lastError = null;
+        AgentRecoveryDecision decision = null;
+        int maxRetries = 2;
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                return tool.handler().handle(toolUse.input());
+            } catch (Exception e) {
+                lastError = e;
+                decision = recoveryPolicy.toolError(toolUse, e);
+                if (decision.type() != AgentRecoveryType.TRANSIENT || attempt >= maxRetries) {
+                    break;
+                }
+                publishHook(AgentHookEventType.ON_RETRY, state.turnCount(), toolUse.name(), Map.of(
+                        "attempt", attempt + 1,
+                        "maxRetries", maxRetries,
+                        "error", blankToPlaceholder(e.getMessage())
+                ));
+                try { Thread.sleep(Math.min(200L * (attempt + 1), 1000L)); } catch (InterruptedException ignored) {}
+            }
+        }
+        // All retries exhausted or non-transient error
+        long toolLatencyMs = System.currentTimeMillis() - toolStartedAt;
+        safeObserver.onToolError(state.turnCount(), toolUse.name(), toolUse.input(), lastError, toolLatencyMs);
+        publishHook(AgentHookEventType.ON_TOOL_ERROR, state.turnCount(), toolUse.name(), Map.of(
+                "input", toolUse.input(),
+                "error", blankToPlaceholder(lastError == null ? null : lastError.getMessage()),
+                "latencyMs", toolLatencyMs
+        ));
+        applyTieredRecovery(state, toolUse, decision != null ? decision : recoveryPolicy.toolError(toolUse, lastError));
+        return null;
+    }
+
+    private void applyTieredRecovery(AgentLoopState state, ToolUseBlock toolUse,
+                                     AgentRecoveryDecision decision) {
+        switch (decision.type()) {
+            case TRANSIENT -> {
+                // Retries exhausted — escalate to parameter recovery
+                AgentRecoveryDecision escalated = new AgentRecoveryDecision(
+                        AgentRecoveryType.PARAMETER, true,
+                        "Transient error persisted after retries: " + decision.reason(),
+                        Map.of(
+                                "error", "transient_escalated",
+                                "originalReason", decision.reason(),
+                                "instruction", "The operation failed after retries. Try an alternative approach or tool."
+                        ));
+                applyToolRecovery(state, toolUse, escalated);
+            }
+            case PARAMETER -> {
+                // Local ReAct fix — model gets error message, tries corrected call
+                applyToolRecovery(state, toolUse, decision);
+            }
+            case SEMANTIC -> {
+                // Global replan — wipe plan, trigger planning stage
+                publishHook(AgentHookEventType.ON_REPLAN, state.turnCount(), toolUse.name(), Map.of(
+                        "reason", decision.reason()
+                ));
+                state.setPlan(null);
+                appendToolResult(state, toolUse, Map.of(
+                        "error", "semantic_error",
+                        "toolName", toolUse.name(),
+                        "reason", decision.reason(),
+                        "instruction", "The current approach is not working. Re-examine the goal and available tools. Consider a completely different strategy or return final_answer if stuck."
+                ));
+                state.transitionReason("tool_result");
+            }
+            default -> applyToolRecovery(state, toolUse, decision);
+        }
     }
 
     private String extractJsonObject(String value) {

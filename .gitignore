@@ -5,6 +5,10 @@ application-local.yml
 .env.*.local
 !.env.example
 data/
+.claude/
+CLAUDE.md
+compile_output.txt
+*.log
 
 HELP.md
 target/

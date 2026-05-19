@@ -28,6 +28,8 @@ import java.util.Map;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
 
 @Service
@@ -41,6 +43,7 @@ public class Hot100AgentService {
     private final ObjectMapper objectMapper;
     private final RuntimeTaskService runtimeTaskService;
     private final Executor executor;
+    private final ConcurrentMap<String, Sinks.Many<AgentStreamEvent>> sinksByTaskId = new ConcurrentHashMap<>();
 
     public Hot100AgentService(AiCodeHelperService aiCodeHelperService,
                               AgentLoopService agentLoopService,
@@ -60,47 +63,95 @@ public class Hot100AgentService {
         this.executor = executor;
     }
 
-    @Transactional
     public AgentTaskView run(Hot100AgentRunRequest request, Long userId) {
-        AgentTask task = createTask(request, userId, AgentTaskStatus.RUNNING);
-        executeTask(task.getTaskId(), request, userId, null);
-        return getTask(task.getTaskId(), userId);
+        AgentTask task = createTask(request, userId, AgentTaskStatus.QUEUED);
+        Sinks.Many<AgentStreamEvent> sink = Sinks.many().multicast().onBackpressureBuffer();
+        sinksByTaskId.put(task.getTaskId(), sink);
+        executor.execute(() -> runAgentLoopAsync(task.getTaskId(), null, request, userId, sink));
+        return toView(task);
     }
 
     public AgentTaskView submit(Hot100AgentRunRequest request, Long userId) {
         AgentTask task = createTask(request, userId, AgentTaskStatus.QUEUED);
+        Sinks.Many<AgentStreamEvent> sink = Sinks.many().multicast().onBackpressureBuffer();
+        sinksByTaskId.put(task.getTaskId(), sink);
         runtimeTaskService.submit(task.getTaskId(), "hot100-agent", slot -> {
             runtimeTaskService.heartbeat(slot.getRuntimeId(), "agent_loop", 25);
-            boolean success = executeTask(task.getTaskId(), request, userId, slot.getRuntimeId());
-            if (!success) {
-                throw new IllegalStateException("Agent task failed");
-            }
+            runAgentLoopAsync(task.getTaskId(), slot.getRuntimeId(), request, userId, sink);
         });
         return toView(task);
     }
 
-    @Transactional
-    public boolean executeTask(String taskId, Hot100AgentRunRequest request, Long userId, String runtimeId) {
-        AgentTask task = agentTaskRepository.findByUserIdAndTaskId(userId, taskId)
-                .orElseThrow(() -> new BusinessException(ErrorCode.NOT_FOUND, "Agent task not found"));
-        AgentRunContext context = new AgentRunContext(taskId, runtimeId, request, userId);
-        boolean success = true;
+    private void runAgentLoopAsync(String taskId, String runtimeId,
+                                   Hot100AgentRunRequest request, Long userId,
+                                   Sinks.Many<AgentStreamEvent> sink) {
         try {
+            AgentTask task = agentTaskRepository.findByUserIdAndTaskId(userId, taskId)
+                    .orElseThrow(() -> new BusinessException(ErrorCode.NOT_FOUND, "Agent task not found"));
             task.setStatus(AgentTaskStatus.RUNNING.name());
             task.setErrorMessage(null);
             agentTaskRepository.save(task);
-            String finalAnswer = executePlan(context);
+
+            AgentRunContext context = new AgentRunContext(taskId, runtimeId, request, userId);
+            AgentLoopObserver sseObserver = createSseObserver(sink);
+
+            String finalAnswer = executePlan(context, sseObserver);
+
             task.setStatus(AgentTaskStatus.SUCCESS.name());
             task.setFinalAnswer(finalAnswer);
             task.setErrorMessage(null);
+            agentTaskRepository.save(task);
+
+            sink.tryEmitNext(new AgentStreamEvent("finish", 0, null,
+                    truncate(finalAnswer, 6000), 0, AgentTaskStatus.SUCCESS.name()));
         } catch (Exception e) {
-            success = false;
-            task.setStatus(AgentTaskStatus.FAILED.name());
-            task.setErrorMessage(truncate(e.getMessage(), 1000));
-            task.setFinalAnswer("Agent task failed before completing the Hot100 workflow.");
+            agentTaskRepository.findByUserIdAndTaskId(userId, taskId).ifPresent(t -> {
+                t.setStatus(AgentTaskStatus.FAILED.name());
+                t.setErrorMessage(truncate(e.getMessage(), 1000));
+                agentTaskRepository.save(t);
+            });
+            sink.tryEmitNext(new AgentStreamEvent("error", 0, null,
+                    truncate(e.getMessage(), 1000), 0, AgentTaskStatus.FAILED.name()));
         }
-        agentTaskRepository.save(task);
-        return success;
+        sink.tryEmitComplete();
+        sinksByTaskId.remove(taskId);
+    }
+
+    private AgentLoopObserver createSseObserver(Sinks.Many<AgentStreamEvent> sink) {
+        return new AgentLoopObserver() {
+            @Override
+            public void onModelTurn(int turn, String input, String output, long latencyMs) {
+                sink.tryEmitNext(new AgentStreamEvent("model_turn", turn, null,
+                        truncate(input, 3000), latencyMs, AgentStepStatus.SUCCESS.name()));
+            }
+
+            @Override
+            public void onToolResult(int turn, String toolName, Map<String, Object> input, Object output, long latencyMs) {
+                sink.tryEmitNext(new AgentStreamEvent("tool_result", turn, toolName,
+                        truncate(toJson(output), 3000), latencyMs, AgentStepStatus.SUCCESS.name()));
+            }
+
+            @Override
+            public void onToolError(int turn, String toolName, Map<String, Object> input, Exception error, long latencyMs) {
+                sink.tryEmitNext(new AgentStreamEvent("tool_error", turn, toolName,
+                        truncate(error.getMessage(), 1000), latencyMs, AgentStepStatus.FAILED.name()));
+            }
+        };
+    }
+
+    public Flux<ServerSentEvent<String>> getStream(String taskId, Long userId) {
+        agentTaskRepository.findByUserIdAndTaskId(userId, taskId)
+                .orElseThrow(() -> new BusinessException(ErrorCode.NOT_FOUND, "Agent task not found"));
+        Sinks.Many<AgentStreamEvent> sink = sinksByTaskId.get(taskId);
+        if (sink == null) {
+            return Flux.empty();
+        }
+        return sink.asFlux()
+                .map(event -> ServerSentEvent.<String>builder()
+                        .id(UUID.randomUUID().toString())
+                        .event(event.type())
+                        .data(toJson(event))
+                        .build());
     }
 
     @Transactional(readOnly = true)
@@ -360,61 +411,6 @@ public class Hot100AgentService {
                 b.onToolError(turn, toolName, input, error, latencyMs);
             }
         };
-    }
-
-    public Flux<ServerSentEvent<String>> runStream(Hot100AgentRunRequest request, Long userId) {
-        Sinks.Many<AgentStreamEvent> sink = Sinks.many().multicast().onBackpressureBuffer();
-        AgentTask task = createTask(request, userId, AgentTaskStatus.RUNNING);
-
-        executor.execute(() -> {
-            String taskId = task.getTaskId();
-            AgentRunContext context = new AgentRunContext(taskId, null, request, userId);
-            try {
-                AgentLoopObserver sseObserver = new AgentLoopObserver() {
-                    @Override
-                    public void onModelTurn(int turn, String input, String output, long latencyMs) {
-                        sink.tryEmitNext(new AgentStreamEvent("model_turn", turn, null,
-                                truncate(input, 3000), latencyMs, AgentStepStatus.SUCCESS.name()));
-                    }
-
-                    @Override
-                    public void onToolResult(int turn, String toolName, Map<String, Object> input, Object output, long latencyMs) {
-                        sink.tryEmitNext(new AgentStreamEvent("tool_result", turn, toolName,
-                                truncate(toJson(output), 3000), latencyMs, AgentStepStatus.SUCCESS.name()));
-                    }
-
-                    @Override
-                    public void onToolError(int turn, String toolName, Map<String, Object> input, Exception error, long latencyMs) {
-                        sink.tryEmitNext(new AgentStreamEvent("tool_error", turn, toolName,
-                                truncate(error.getMessage(), 1000), latencyMs, AgentStepStatus.FAILED.name()));
-                    }
-                };
-
-                String finalAnswer = executePlan(context, sseObserver);
-
-                task.setStatus(AgentTaskStatus.SUCCESS.name());
-                task.setFinalAnswer(finalAnswer);
-                agentTaskRepository.save(task);
-
-                sink.tryEmitNext(new AgentStreamEvent("finish", 0, null,
-                        truncate(finalAnswer, 6000), 0, AgentTaskStatus.SUCCESS.name()));
-                sink.tryEmitComplete();
-            } catch (Exception e) {
-                task.setStatus(AgentTaskStatus.FAILED.name());
-                task.setErrorMessage(truncate(e.getMessage(), 1000));
-                agentTaskRepository.save(task);
-                sink.tryEmitNext(new AgentStreamEvent("error", 0, null,
-                        truncate(e.getMessage(), 1000), 0, AgentTaskStatus.FAILED.name()));
-                sink.tryEmitComplete();
-            }
-        });
-
-        return sink.asFlux()
-                .map(event -> ServerSentEvent.<String>builder()
-                        .id(UUID.randomUUID().toString())
-                        .event(event.type())
-                        .data(toJson(event))
-                        .build());
     }
 
     private boolean isBlank(String value) {

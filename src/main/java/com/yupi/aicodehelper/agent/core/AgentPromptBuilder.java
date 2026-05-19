@@ -38,6 +38,9 @@ public class AgentPromptBuilder {
                 - Do not call tools that are not listed.
                 - Prefer a final_answer once you have enough observations.
 
+                Execution plan:
+                %s
+
                 Current todos:
                 %s
 
@@ -48,6 +51,7 @@ public class AgentPromptBuilder {
                 %s
                 """.formatted(
                 context.toolRegistry().describeAvailableTools(),
+                renderPlan(context.state()),
                 renderTodos(context.state()),
                 renderCompactSummary(context.state()),
                 renderMessages(context.state())
@@ -59,6 +63,25 @@ public class AgentPromptBuilder {
             return "[]";
         }
         return toJson(state.todos());
+    }
+
+    public String renderPlan(AgentLoopState state) {
+        if (state.plan() == null || state.plan().isEmpty()) {
+            return "(no execution plan — proceed with ReAct loop)";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (PlanStep step : state.plan()) {
+            sb.append(step.order() + 1).append(". ");
+            sb.append(step.action());
+            if (step.isToolStep()) {
+                sb.append(" [tool: ").append(step.toolName()).append("]");
+            }
+            if (step.rationale() != null && !step.rationale().isBlank()) {
+                sb.append(" (").append(step.rationale()).append(")");
+            }
+            sb.append("\n");
+        }
+        return sb.toString().trim();
     }
 
     public String renderMessages(AgentLoopState state) {

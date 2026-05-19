@@ -2,6 +2,9 @@ package com.yupi.aicodehelper.agent;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.yupi.aicodehelper.ai.rag.RedisEmbeddingStore;
+import dev.langchain4j.data.embedding.Embedding;
+import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.rag.content.Content;
 import dev.langchain4j.rag.content.retriever.ContentRetriever;
 import dev.langchain4j.rag.query.Query;
@@ -9,6 +12,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.support.ResourcePatternResolver;
 import org.springframework.core.io.support.ResourcePatternUtils;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StreamUtils;
 
@@ -32,6 +36,8 @@ public class AgentKnowledgeService {
     private static final Pattern MARKDOWN_HEADING = Pattern.compile("^(#{1,3})\\s+(.+)$");
 
     private final ObjectProvider<ContentRetriever> contentRetrieverProvider;
+    private final ObjectProvider<RedisEmbeddingStore> redisStoreProvider;
+    private final ObjectProvider<EmbeddingModel> embeddingModelProvider;
     private final ObjectMapper objectMapper;
 
     private volatile List<KnowledgeChunk> localChunks;
@@ -39,51 +45,140 @@ public class AgentKnowledgeService {
     public AgentKnowledgeService(ObjectProvider<ContentRetriever> contentRetrieverProvider,
                                  ObjectMapper objectMapper) {
         this.contentRetrieverProvider = contentRetrieverProvider;
+        this.redisStoreProvider = null;
+        this.embeddingModelProvider = null;
+        this.objectMapper = objectMapper;
+    }
+
+    @Autowired
+    public AgentKnowledgeService(ObjectProvider<ContentRetriever> contentRetrieverProvider,
+                                 ObjectProvider<RedisEmbeddingStore> redisStoreProvider,
+                                 ObjectProvider<EmbeddingModel> embeddingModelProvider,
+                                 ObjectMapper objectMapper) {
+        this.contentRetrieverProvider = contentRetrieverProvider;
+        this.redisStoreProvider = redisStoreProvider;
+        this.embeddingModelProvider = embeddingModelProvider;
         this.objectMapper = objectMapper;
     }
 
     public List<KnowledgeSnippetView> retrieve(String query, int limit) {
-        int realLimit = Math.max(1, Math.min(limit, 8));
-        List<KnowledgeSnippetView> vectorResults = retrieveWithVectorStore(query, realLimit);
-        if (!vectorResults.isEmpty()) {
-            return vectorResults;
-        }
-        return retrieveWithLocalChunks(query, realLimit);
+        return retrieve(query, limit, SearchFilter.none());
     }
 
-    private List<KnowledgeSnippetView> retrieveWithVectorStore(String query, int limit) {
-        ContentRetriever contentRetriever = contentRetrieverProvider.getIfAvailable();
-        if (contentRetriever == null || query == null || query.isBlank()) {
-            return List.of();
-        }
-        try {
-            return contentRetriever.retrieve(Query.from(query)).stream()
-                    .limit(limit)
-                    .map(this::toSnippet)
+    public List<KnowledgeSnippetView> retrieve(String query, int limit, SearchFilter filter) {
+        int realLimit = Math.max(1, Math.min(limit, 8));
+        List<KnowledgeSnippetView> vectorResults = retrieveWithVectorStore(query, realLimit * 2, filter);
+        List<KnowledgeSnippetView> keywordResults = retrieveWithLocalChunks(query, realLimit * 2, filter);
+
+        if (!vectorResults.isEmpty() || !keywordResults.isEmpty()) {
+            List<HybridRanker.KnowledgeChunk> chunks = localChunks().stream()
+                    .map(kc -> new HybridRanker.KnowledgeChunk(
+                            kc.source(), kc.slug(), kc.title(), kc.section(), kc.content()))
                     .toList();
-        } catch (Exception e) {
+            HybridRanker ranker = new HybridRanker(chunks);
+            return ranker.rank(query, vectorResults, realLimit);
+        }
+        return List.of();
+    }
+
+    private List<KnowledgeSnippetView> retrieveWithVectorStore(String query, int limit, SearchFilter filter) {
+        if (query == null || query.isBlank()) {
             return List.of();
         }
+
+        // Prefer Redis (persistent, fast cold start). Fall back to InMemory if Redis unavailable.
+        RedisEmbeddingStore redisStore = redisStoreProvider != null ? redisStoreProvider.getIfAvailable() : null;
+        EmbeddingModel embeddingModel = embeddingModelProvider != null ? embeddingModelProvider.getIfAvailable() : null;
+        if (redisStore != null && embeddingModel != null && !redisStore.isEmpty()) {
+            try {
+                Embedding queryEmbedding = embeddingModel.embed(query).content();
+                double adjustedMinScore = dynamicMinScore(query);
+                return redisStore.search(queryEmbedding.vector(), limit, adjustedMinScore).stream()
+                        .filter(r -> filter.isEmpty()
+                                || filter.matches(r.difficulty(),
+                                        r.tags() != null && !r.tags().isBlank()
+                                                ? List.of(r.tags().split(",\\s*"))
+                                                : List.of(),
+                                        r.pattern(), null))
+                        .map(r -> new KnowledgeSnippetView(
+                                r.fileName(), null, null, null,
+                                (int) Math.round(r.score() * 100),
+                                List.of(),
+                                truncate(r.text(), MAX_CONTENT_LENGTH)))
+                        .toList();
+            } catch (Exception ignored) {
+            }
+        }
+
+        // Fallback: LangChain4j InMemoryEmbeddingStore
+        ContentRetriever contentRetriever = contentRetrieverProvider.getIfAvailable();
+        if (contentRetriever != null) {
+            try {
+                double adjustedMinScore = dynamicMinScore(query);
+                return contentRetriever.retrieve(Query.from(query)).stream()
+                        .filter(c -> passesFilter(c, filter))
+                        .limit(limit)
+                        .map(this::toSnippet)
+                        .toList();
+            } catch (Exception ignored) {
+            }
+        }
+        return List.of();
+    }
+
+    private double dynamicMinScore(String query) {
+        int termCount = splitTerms(query).size();
+        if (termCount <= 1) return 0.55;
+        if (termCount <= 2) return 0.50;
+        return 0.45;
+    }
+
+    private boolean passesFilter(Content content, SearchFilter filter) {
+        if (filter.isEmpty()) return true;
+        if (content.textSegment() == null) return true;
+        var meta = content.textSegment().metadata();
+        String difficulty = meta.getString("difficulty");
+        String tagsStr = meta.getString("tags");
+        List<String> tags = tagsStr != null && !tagsStr.isBlank()
+                ? List.of(tagsStr.split(",\\s*"))
+                : List.of();
+        String pattern = meta.getString("pattern");
+        String tenant = meta.getString("tenant");
+        return filter.matches(difficulty, tags, pattern, tenant);
     }
 
     private KnowledgeSnippetView toSnippet(Content content) {
         String source = "vector-store";
+        String difficulty = null;
+        String tags = null;
+        String pattern = null;
         if (content.textSegment() != null && content.textSegment().metadata() != null) {
-            String fileName = content.textSegment().metadata().getString("file_name");
+            var meta = content.textSegment().metadata();
+            String fileName = meta.getString("file_name");
             if (fileName != null && !fileName.isBlank()) {
                 source = fileName;
             }
+            difficulty = meta.getString("difficulty");
+            tags = meta.getString("tags");
+            pattern = meta.getString("pattern");
         }
         String text = content.textSegment() == null ? "" : content.textSegment().text();
-        return new KnowledgeSnippetView(source, null, null, null, null, List.of(), truncate(text, MAX_CONTENT_LENGTH));
+        return new KnowledgeSnippetView(source, null, null, null, null,
+                tagsToList(tags), truncate(text, MAX_CONTENT_LENGTH));
     }
 
-    private List<KnowledgeSnippetView> retrieveWithLocalChunks(String query, int limit) {
+    private List<String> tagsToList(String tags) {
+        if (tags == null || tags.isBlank()) return List.of();
+        return List.of(tags.split(",\\s*"));
+    }
+
+    private List<KnowledgeSnippetView> retrieveWithLocalChunks(String query, int limit, SearchFilter filter) {
         List<String> terms = splitTerms(query);
         if (terms.isEmpty()) {
             return List.of();
         }
         return localChunks().stream()
+                .filter(chunk -> passesLocalFilter(chunk, filter))
                 .map(chunk -> new ScoredChunk(chunk, score(chunk, terms), matchedTerms(chunk, terms)))
                 .filter(item -> item.score() > 0)
                 .sorted(Comparator.comparingInt(ScoredChunk::score).reversed()
@@ -91,6 +186,17 @@ public class AgentKnowledgeService {
                 .limit(limit)
                 .map(item -> toSnippet(item, terms))
                 .toList();
+    }
+
+    private boolean passesLocalFilter(KnowledgeChunk chunk, SearchFilter filter) {
+        if (filter.isEmpty()) return true;
+        String mappedDifficulty = mapDifficulty(chunk.difficulty());
+        String mappedPattern = chunk.pattern();
+        return filter.matches(mappedDifficulty, chunk.tags(), mappedPattern, null);
+    }
+
+    private String mapDifficulty(String d) {
+        return d == null ? "" : d;
     }
 
     private KnowledgeSnippetView toSnippet(ScoredChunk item, List<String> terms) {
@@ -149,7 +255,6 @@ public class AgentKnowledgeService {
                             root.path("summary").asText("")
                     ));
                 } catch (Exception ignored) {
-                    // Keep the local RAG index available even if one generated problem file is malformed.
                 }
             }
             return metadataBySlug;
@@ -192,7 +297,8 @@ public class AgentKnowledgeService {
         for (String line : markdown.split("\\R")) {
             Matcher matcher = MARKDOWN_HEADING.matcher(line);
             if (matcher.matches()) {
-                chunkIndex = flushChunk(chunks, filename, slug, title, section, sectionContent, metadata, chunkIndex);
+                chunkIndex = flushChunk(chunks, filename, slug, title, section,
+                        sectionContent, metadata, chunkIndex);
                 section = matcher.group(2).trim();
             }
             sectionContent.append(line).append('\n');
@@ -228,6 +334,10 @@ public class AgentKnowledgeService {
                 slug,
                 title,
                 section,
+                content,
+                metadata == null ? "" : metadata.difficulty(),
+                metadata == null ? List.<String>of() : metadata.tags(),
+                metadata == null ? "" : metadata.pattern(),
                 searchableContent
         ));
         return chunkIndex + 1;
@@ -326,7 +436,7 @@ public class AgentKnowledgeService {
     }
 
     private String stripBom(String value) {
-        if (value != null && !value.isEmpty() && value.charAt(0) == '\uFEFF') {
+        if (value != null && !value.isEmpty() && value.charAt(0) == '﻿') {
             return value.substring(1);
         }
         return value;
@@ -347,11 +457,34 @@ public class AgentKnowledgeService {
                                    String summary) {
     }
 
+    // Extended KnowledgeChunk including metadata fields for filtering
     private record KnowledgeChunk(String source,
                                   String slug,
                                   String title,
                                   String section,
-                                  String content) {
+                                  String content,
+                                  String difficulty,
+                                  List<String> tags,
+                                  String pattern,
+                                  String searchableContent) {
+        KnowledgeChunk(String source, String slug, String title, String section,
+                       String content, String difficulty, List<String> tags,
+                       String pattern, String searchableContent) {
+            this.source = source;
+            this.slug = slug;
+            this.title = title;
+            this.section = section;
+            this.content = content;
+            this.difficulty = difficulty;
+            this.tags = tags;
+            this.pattern = pattern;
+            this.searchableContent = searchableContent;
+        }
+
+        // Backward-compat: when metadata is not available
+        KnowledgeChunk(String source, String slug, String title, String section, String content) {
+            this(source, slug, title, section, content, "", List.of(), "", content);
+        }
     }
 
     private record ScoredChunk(KnowledgeChunk chunk, int score, List<String> matchedTerms) {

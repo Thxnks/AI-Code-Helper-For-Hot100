@@ -13,6 +13,7 @@ public class RuntimeSlotState {
     private volatile String stage;
     private volatile int progress;
     private volatile String errorMessage;
+    private volatile String output;
     private final LocalDateTime createdAt;
     private volatile LocalDateTime heartbeatAt;
     private volatile LocalDateTime startedAt;
@@ -107,6 +108,14 @@ public class RuntimeSlotState {
 
     public String getErrorMessage() {
         return errorMessage;
+    }
+
+    public String getOutput() {
+        return output;
+    }
+
+    synchronized void setOutput(String output) {
+        this.output = output;
     }
 
     public LocalDateTime getCreatedAt() {

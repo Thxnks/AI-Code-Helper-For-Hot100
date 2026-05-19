@@ -82,6 +82,11 @@ class Hot100AgentServiceTest {
             int currentTurn = turn.incrementAndGet();
             if (currentTurn == 1) {
                 return """
+                        {"type":"plan","steps":[{"action":"Create todo list to organize work","toolName":"todo_write","rationale":"track tasks","order":0}]}
+                        """;
+            }
+            if (currentTurn == 2) {
+                return """
                         {"type":"tool_use","id":"toolu_todo","name":"todo_write","input":{"todos":[{"content":"Check weak tags","status":"IN_PROGRESS"}]}}
                         """;
             }

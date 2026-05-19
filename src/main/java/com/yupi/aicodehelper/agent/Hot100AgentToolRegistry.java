@@ -3,6 +3,7 @@ package com.yupi.aicodehelper.agent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yupi.aicodehelper.agent.core.AgentToolRegistry;
 import com.yupi.aicodehelper.agent.core.AgentToolPermissionLevel;
+import com.yupi.aicodehelper.agent.core.RuntimeTaskService;
 import com.yupi.aicodehelper.agent.core.SubAgentResult;
 import com.yupi.aicodehelper.agent.core.SubAgentService;
 import com.yupi.aicodehelper.ai.AiCodeHelperService;
@@ -34,6 +35,7 @@ public class Hot100AgentToolRegistry {
     private final SubAgentService subAgentService;
     private final AiCodeHelperService aiCodeHelperService;
     private final ObjectProvider<McpClient> mcpClientProvider;
+    private final RuntimeTaskService runtimeTaskService;
     private final ObjectMapper objectMapper;
 
     public Hot100AgentToolRegistry(Hot100Service hot100Service,
@@ -44,6 +46,7 @@ public class Hot100AgentToolRegistry {
                                    SubAgentService subAgentService,
                                    AiCodeHelperService aiCodeHelperService,
                                    ObjectProvider<McpClient> mcpClientProvider,
+                                   RuntimeTaskService runtimeTaskService,
                                    ObjectMapper objectMapper) {
         this.hot100Service = hot100Service;
         this.hot100ProgressService = hot100ProgressService;
@@ -53,6 +56,7 @@ public class Hot100AgentToolRegistry {
         this.subAgentService = subAgentService;
         this.aiCodeHelperService = aiCodeHelperService;
         this.mcpClientProvider = mcpClientProvider;
+        this.runtimeTaskService = runtimeTaskService;
         this.objectMapper = objectMapper;
     }
 
@@ -132,6 +136,7 @@ public class Hot100AgentToolRegistry {
                 .register("reviewWrongAnswerWithSubAgent", "Ask a focused sub-agent to review wrong-answer evidence without writing progress. Input: problemSlug.", input ->
                         runWrongAnswerSubAgent(input, request));
         registerMcpTools(registry);
+        registerBackgroundTools(registry, request);
         return registry;
     }
 
@@ -172,6 +177,45 @@ public class Hot100AgentToolRegistry {
                 aiCodeHelperService::runHot100AgentLoopTurn,
                 4
         );
+    }
+
+    private void registerBackgroundTools(AgentToolRegistry registry, Hot100AgentRunRequest request) {
+        registry
+                .register("background_run",
+                        "Launch a background analysis task. Input: {\"description\":\"...\"}. Returns task_id immediately.",
+                        AgentToolPermissionLevel.WRITE, input -> {
+                            String description = stringArg(input, "description", request.goal());
+                            requireText(description, "description is required for background_run");
+                            var slot = runtimeTaskService.runBackgroundTask(description, () -> {
+                                AgentToolRegistry bgRegistry = new AgentToolRegistry()
+                                        .register("retrieveKnowledge",
+                                                "Retrieve supporting knowledge. Optional input: query, limit.",
+                                                args -> agentKnowledgeService.retrieve(
+                                                        stringArg(args, "query", description),
+                                                        intArg(args, "limit", 3)));
+                                SubAgentResult result = subAgentService.run(
+                                        description, bgRegistry,
+                                        aiCodeHelperService::runHot100AgentLoopTurn, 3);
+                                return result.summary();
+                            });
+                            return Map.of("task_id", slot.getRuntimeId(), "status", "running");
+                        })
+                .register("background_check",
+                        "Check a background task status. Input: {\"task_id\":\"...\"}.",
+                        input -> {
+                            String taskId = stringArg(input, "task_id", "");
+                            requireText(taskId, "task_id is required for background_check");
+                            return runtimeTaskService.get(taskId)
+                                    .map(slot -> Map.of(
+                                            "task_id", slot.getRuntimeId(),
+                                            "status", slot.getStatus().name().toLowerCase(),
+                                            "stage", slot.getStage(),
+                                            "progress", slot.getProgress(),
+                                            "error", slot.getErrorMessage() != null ? slot.getErrorMessage() : "",
+                                            "output", slot.getOutput() != null ? slot.getOutput() : ""
+                                    ))
+                                    .orElse(Map.of("error", "task not found"));
+                        });
     }
 
     private void registerMcpTools(AgentToolRegistry registry) {

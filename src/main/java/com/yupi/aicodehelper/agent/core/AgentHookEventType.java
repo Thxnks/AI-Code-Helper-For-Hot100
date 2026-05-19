@@ -8,5 +8,9 @@ public enum AgentHookEventType {
     ON_TOOL_ERROR,
     ON_PERMISSION_DENIED,
     ON_COMPACT,
-    ON_RECOVERY
+    ON_RECOVERY,
+    ON_PLAN_VALIDATED,
+    ON_PLAN_FAILED,
+    ON_RETRY,
+    ON_REPLAN
 }

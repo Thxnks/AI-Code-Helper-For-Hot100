@@ -10,9 +10,11 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 @Service
 public class RuntimeTaskService {
@@ -20,6 +22,7 @@ public class RuntimeTaskService {
     private final Executor executor;
     private final ConcurrentMap<String, RuntimeSlotState> slotsByRuntimeId = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, List<String>> runtimeIdsByTaskId = new ConcurrentHashMap<>();
+    private final ConcurrentLinkedQueue<BackgroundNotification> notificationQueue = new ConcurrentLinkedQueue<>();
 
     public RuntimeTaskService(@Qualifier("hot100TaskExecutor") Executor executor) {
         this.executor = executor;
@@ -81,6 +84,51 @@ public class RuntimeTaskService {
         return slotsByRuntimeId.values().stream()
                 .sorted(Comparator.comparing(RuntimeSlotState::getCreatedAt).reversed())
                 .toList();
+    }
+
+    public void pushNotification(String runtimeId, String status, String preview) {
+        notificationQueue.add(new BackgroundNotification(runtimeId, status, preview));
+    }
+
+    public List<BackgroundNotification> drainNotifications() {
+        List<BackgroundNotification> list = new ArrayList<>();
+        BackgroundNotification n;
+        while ((n = notificationQueue.poll()) != null) {
+            list.add(n);
+        }
+        return list;
+    }
+
+    public RuntimeSlotState runBackgroundTask(String description, Supplier<String> work) {
+        String taskId = "bg_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        String runtimeId = "rt_" + UUID.randomUUID().toString().replace("-", "");
+        int attempt = nextAttempt(taskId);
+        RuntimeSlotState state = new RuntimeSlotState(runtimeId, taskId, "background-agent", attempt);
+        slotsByRuntimeId.put(runtimeId, state);
+        runtimeIdsByTaskId.compute(taskId, (ignored, existing) -> {
+            List<String> next = existing == null ? new ArrayList<>() : new ArrayList<>(existing);
+            next.add(runtimeId);
+            return next;
+        });
+
+        CompletableFuture.runAsync(() -> {
+            state.markRunning(Thread.currentThread().getName());
+            try {
+                String result = work.get();
+                state.setOutput(result);
+                state.markSuccess();
+                notificationQueue.add(new BackgroundNotification(
+                        runtimeId, "completed", truncate(result, 500)));
+            } catch (Exception e) {
+                String errorText = truncate(e.getMessage(), 1000);
+                state.setOutput(errorText);
+                state.markFailed(errorText);
+                notificationQueue.add(new BackgroundNotification(
+                        runtimeId, "failed", truncate(errorText, 500)));
+            }
+        }, executor);
+
+        return state;
     }
 
     private int nextAttempt(String taskId) {

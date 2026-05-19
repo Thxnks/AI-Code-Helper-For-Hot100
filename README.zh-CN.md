@@ -6,22 +6,24 @@ Spring Boot + Vue 全栈项目，在传统后端业务系统之上自研了一�
 
 ## 与常规 AI 项目的区别
 
-多数简历中的 AI 项目停留在"调用大模型 API + 前端展示"的薄封装层面。本项目的核心差异在于：**Agent Runtime 是自主实现的**。ReAct 多轮循环、工具权限分级、三层上下文压缩、结构化异常恢复、子代理隔离、执行过程 SSE 流式追踪——这些编排层代码全部从零构建，LangChain4j 仅负责底层的模型通信。
+多数简历中的 AI 项目停留在"调用大模型 API + 前端展示"的薄封装层面。本项目的核心差异在于：**Agent Runtime 是自主实现的**。ReAct 多轮循环、工具权限分级、计划书写与校验、三层上下文压缩、工具三级恢复、工具幂等保护、子代理隔离、执行过程 SSE 流式追踪——这些编排层代码全部从零构建，LangChain4j 仅负责底层的模型通信。
 
 ## 技术亮点
 
 ### Agent Runtime（自研 ReAct 引擎）
 
 - **自研 ReAct 循环**：`模型推理 → 工具调用 → 观察结果 → 下一轮决策 → 最终答案`，单次任务最多 8 轮自主执行。LangChain4j 在此仅作为 ChatModel 的适配层，所有循环控制、状态管理和决策解析均由自研代码实现。
+- **计划书写与校验**：长链路 Agent 执行前先要求模型输出结构化 JSON 计划，校验步骤顺序、工具是否存在、是否包含至少一个工具型数据获取步骤；校验失败时把问题反馈给模型并要求重写计划，校验通过后将计划渲染回后续提示词。
 - **三层渐进式上下文压缩**（参考 Claude Code 策略）：Tier 1 Snip — 按评分规则移除低价值历史消息，保留原始目标与最近对话；Tier 2 Microcompact — 对大体积 JSON 工具返回做字段级裁剪，仅保留关键信息；Tier 3 Autocompact — 调用模型生成结构化语义摘要（`goal`、`done`、`findings`、`remaining`），替换全部消息列表。前两级为纯内存操作，仅在仍不满足限制时进入网络调用级压缩。
 - **四级工具权限门**：`READ`、`WRITE`、`EXTERNAL`、`SENSITIVE`。权限拒绝时返回结构化 `tool_result` 错误信息，而非抛出异常——模型感知到工具被拒绝后可自行调整策略，而非因异常中断循环。
-- **结构化异常恢复**：覆盖四种故障场景——模型输出 JSON 解析失败、调用未注册工具、工具执行异常、超过最大轮数。每种场景对应特定 recovery message 格式，模型可据此修正后续行为。
-- **事件钩子体系**：模型轮次、工具调用、权限拒绝、上下文压缩、异常恢复等关键节点均触发 Hook 事件。Observer 监听这些事件完成 Step 持久化、心跳上报和 SSE 推送——业务逻辑与循环内核完全解耦。
+- **工具幂等保护**：基于 Redis 记录工具名 + 规范化入参的 SHA-256 哈希，10 分钟 TTL 内重复工具调用直接复用缓存结果，降低重试过程中的重复写入和重复外部操作风险。
+- **工具三级恢复策略**：瞬时错误自动重试，参数或模型输出错误以结构化提示交还模型修正，语义级错误触发 replan 路径。未注册工具、JSON 解析失败、工具执行异常、超过最大轮数都会生成类型化 recovery decision。
+- **事件钩子体系**：模型轮次、工具调用、权限拒绝、上下文压缩、计划校验、重新规划、异常恢复等关键节点均触发 Hook 事件。Observer 监听这些事件完成 Step 持久化、心跳上报和 SSE 推送——业务逻辑与循环内核完全解耦。
 
 ### AI 集成
 
 - **MCP 双通道分流**：同一套 MCP 外部工具（如 DashScope WebSearch），同时服务于普通聊天（经 LangChain4j 原生 `McpToolProvider`）和 Agent 工具注册表（动态注册为 `mcp_*` 工具，归属 `EXTERNAL` 权限）。通过 `ObjectProvider<McpClient>` 实现条件注入，未启用 MCP 时外部工具静默跳过，不影响核心流程。
-- **可解释本地 RAG**：加载 Hot100 markdown 与 JSON 资源，按章节切分并补充题目元数据（slug、难度、标签、解题模式），返回结果包含来源文件、匹配分数和命中词。整个过程完全可追溯，非黑盒向量检索，便于调试和测试。
+- **混合可解释 RAG**：加载 Hot100 markdown 与 JSON 资源，按章节切分并补充题目元数据（slug、难度、标签、解题模式），再通过 `HybridRanker` 合并 Redis 向量相似度和本地关键词分数。返回结果包含来源文件、匹配分数、命中词和命中窗口，整个过程可追溯，便于调试和测试。
 - **Agent 步骤级 SSE 流式推送**：区别于聊天场景的 token 级逐字流式（LangChain4j 原生支持），本模块推送的是 Agent 执行事件（`model_turn`、`tool_result`、`tool_error`、`finish`）。基于 Reactor `Sinks.Many` 桥接阻塞式 Agent 循环与响应式 SSE 流，前端可实时展示执行过程而非等待最终结果。
 
 ### 长期记忆系统
@@ -97,16 +99,19 @@ Hot100 Agent 可以启动聚焦型后台分析任务，避免阻塞当前 ReAct 
 
 `AgentKnowledgeService` 为 Agent 提供 `retrieveKnowledge` 工具。
 
-当前检索基线：
+当前检索链路：
 
 - 加载 `src/main/resources/hot100/markdown/*.md`
 - 加载 `src/main/resources/hot100/json/*.json`
 - 按 markdown 标题切分章节级 chunk
 - 为 chunk 补充题目元数据：slug、title、difficulty、tags、pattern、summary
+- 可选将 docs 与 Hot100 笔记写入 LangChain4j embedding 检索链路
+- 通过 `RedisEmbeddingStore` 持久化 embedding 向量，冷启动时可复用索引
+- 在可用时同时查询内存 `ContentRetriever` 和 Redis 向量检索
+- 使用 `HybridRanker` 做二次排序：向量分占 60%，归一化关键词分占 40%
 - 返回可解释字段：source、slug、title、section、score、matchedTerms、content
-- 保留 LangChain4j `ContentRetriever` 作为后续接入向量检索的扩展点
 
-这样项目在没有外部向量库时也有稳定可测的本地 RAG 能力，后续也可以平滑升级到 embedding / vector search。
+这样项目在没有外部向量库时也有稳定可测的本地 RAG 能力；开启 RAG 后，也能使用 embedding / vector search 做语义检索。
 
 ## MCP 集成
 
@@ -168,6 +173,12 @@ Agent 事件携带 `type`、`turn`、`toolName`、`data`、`latencyMs`、`status
 | TIER3_AUTOCOMPACT | 调用模型生成结构化摘要（`goal`、`done`、`findings`、`remaining`），替换全部消息 | 网络 I/O + token 消耗 |
 
 前两层直接操作 messages 列表，不调 `state.compact()`。只有 Tier 3 才调 `state.compact()`，清空全部消息，只保留原始目标 + 模型摘要。
+
+## 计划、幂等与恢复
+
+- **计划校验**：`AgentPlanValidator` 最多接受 8 个计划步骤，校验步骤顺序、未知工具名，并要求数据型任务至少包含一个工具调用步骤；计划不合格时会把问题反馈给模型进行一次修正。
+- **工具幂等**：`ToolIdempotencyGuard` 按工具名和排序后的 JSON 入参生成哈希，成功结果写入 Redis 10 分钟；重复调用返回 `_idempotent=true` 的缓存结果。
+- **三级恢复**：`AgentRecoveryPolicy` 将错误分为 `TRANSIENT`、`PARAMETER`、`SEMANTIC`。瞬时错误重试原调用，参数错误要求模型修正入参或输出格式，语义错误清空当前计划并触发 replan 事件。
 
 ## 核心接口
 
@@ -280,7 +291,7 @@ npm run build
 
 基于 Spring Boot + Vue 实现全栈 AI 学习助手，自研 ReAct Agent Runtime 作为核心编排引擎。后端包含 JWT 认证、Hot100 学习闭环（进度追踪、错题分析、薄弱标签、推荐题单、学习计划）、流式 AI 对话，以及自研 Agent 执行引擎。
 
-Agent Runtime 是核心差异点：多轮 ReAct 循环、四级工具权限门控、三层渐进式上下文压缩（参考 Claude Code 策略）、结构化异常恢复、事件钩子可观测、长期记忆、子代理隔离和 SSE 步骤级事件流式推送。LangChain4j 仅作为模型传输层——所有编排逻辑全部自研。工具执行通过持久化 step trace 和合并后的 runtime timeline 实现全链路可观测。
+Agent Runtime 是核心差异点：多轮 ReAct 循环、四级工具权限门控、计划书写与校验、Redis 工具幂等保护、三层渐进式上下文压缩（参考 Claude Code 策略）、工具三级恢复、事件钩子可观测、长期记忆、子代理隔离和 SSE 步骤级事件流式推送。LangChain4j 仅作为模型传输层——所有编排逻辑全部自研。工具执行通过持久化 step trace 和合并后的 runtime timeline 实现全链路可观测。
 
 ## 项目结构
 

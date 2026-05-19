@@ -12,6 +12,7 @@ public class AgentLoopState {
     private String transitionReason;
     private boolean finished;
     private String finalAnswer;
+    private List<PlanStep> plan;
 
     public AgentLoopState(String userMessage) {
         this.messages.add(new AgentMessage("user", userMessage));
@@ -67,6 +68,14 @@ public class AgentLoopState {
 
     public String finalAnswer() {
         return finalAnswer;
+    }
+
+    public List<PlanStep> plan() {
+        return plan;
+    }
+
+    public void setPlan(List<PlanStep> plan) {
+        this.plan = plan;
     }
 
     public void finish(String finalAnswer) {
