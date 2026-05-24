@@ -3,11 +3,16 @@ package com.yupi.aicodehelper.agent.core;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.yupi.aicodehelper.agent.KnowledgeSnippetView;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.ArrayList;
 import java.util.List;
@@ -44,17 +49,21 @@ public class AgentLoopService {
     private final RuntimeTaskService runtimeTaskService;
     private final AgentPlanValidator planValidator;
     private final ToolIdempotencyGuard idempotencyGuard;
+    private final AgentSelfReviewer selfReviewer;
+    private final AgentApprovalHandler approvalHandler;
 
     public AgentLoopService(ObjectMapper objectMapper) {
         this(objectMapper, SkillCatalogService.of(Map.of()), new AgentPermissionGate(), new AgentHookManager(),
                 new AgentPromptBuilder(objectMapper), new AgentRecoveryPolicy(),
-                new TaskGraphService(new InMemoryTaskBoard()), null, new AgentPlanValidator(), null);
+                new TaskGraphService(new InMemoryTaskBoard()), null, new AgentPlanValidator(), null,
+                null, null);
     }
 
     public AgentLoopService(ObjectMapper objectMapper, SkillCatalogService skillCatalogService) {
         this(objectMapper, skillCatalogService, new AgentPermissionGate(), new AgentHookManager(),
                 new AgentPromptBuilder(objectMapper), new AgentRecoveryPolicy(),
-                new TaskGraphService(new InMemoryTaskBoard()), null, new AgentPlanValidator(), null);
+                new TaskGraphService(new InMemoryTaskBoard()), null, new AgentPlanValidator(), null,
+                null, null);
     }
 
     public AgentLoopService(ObjectMapper objectMapper,
@@ -62,7 +71,8 @@ public class AgentLoopService {
                             AgentPermissionGate permissionGate) {
         this(objectMapper, skillCatalogService, permissionGate, new AgentHookManager(),
                 new AgentPromptBuilder(objectMapper), new AgentRecoveryPolicy(),
-                new TaskGraphService(new InMemoryTaskBoard()), null, new AgentPlanValidator(), null);
+                new TaskGraphService(new InMemoryTaskBoard()), null, new AgentPlanValidator(), null,
+                null, null);
     }
 
     public AgentLoopService(ObjectMapper objectMapper,
@@ -71,7 +81,7 @@ public class AgentLoopService {
                             AgentHookManager hookManager) {
         this(objectMapper, skillCatalogService, permissionGate, hookManager, new AgentPromptBuilder(objectMapper),
                 new AgentRecoveryPolicy(), new TaskGraphService(new InMemoryTaskBoard()), null,
-                new AgentPlanValidator(), null);
+                new AgentPlanValidator(), null, null, null);
     }
 
     @Autowired
@@ -88,7 +98,8 @@ public class AgentLoopService {
                 new TaskGraphService(taskBoard),
                 runtimeTaskServiceProvider.getIfAvailable(),
                 new AgentPlanValidator(),
-                new ToolIdempotencyGuard(stringRedisTemplateProvider.getIfAvailable(), objectMapper));
+                new ToolIdempotencyGuard(stringRedisTemplateProvider.getIfAvailable(), objectMapper),
+                new AgentSelfReviewer(objectMapper), null);
     }
 
     public AgentLoopService(ObjectMapper objectMapper,
@@ -100,7 +111,9 @@ public class AgentLoopService {
                             TaskGraphService taskGraphService,
                             RuntimeTaskService runtimeTaskService,
                             AgentPlanValidator planValidator,
-                            ToolIdempotencyGuard idempotencyGuard) {
+                            ToolIdempotencyGuard idempotencyGuard,
+                            AgentSelfReviewer selfReviewer,
+                            AgentApprovalHandler approvalHandler) {
         this.objectMapper = objectMapper;
         this.skillCatalogService = skillCatalogService;
         this.permissionGate = permissionGate;
@@ -111,6 +124,8 @@ public class AgentLoopService {
         this.runtimeTaskService = runtimeTaskService;
         this.planValidator = planValidator;
         this.idempotencyGuard = idempotencyGuard;
+        this.selfReviewer = selfReviewer;
+        this.approvalHandler = approvalHandler;
     }
 
     public AgentLoopState run(String userGoal,
@@ -132,6 +147,15 @@ public class AgentLoopService {
                               AgentToolRegistry toolRegistry,
                               AgentTurnClient turnClient,
                               AgentLoopObserver observer,
+                              AgentPermissionContext permissionContext,
+                              String runId) {
+        return run(userGoal, toolRegistry, turnClient, observer, permissionContext, DEFAULT_MAX_TURNS, null, runId);
+    }
+
+    public AgentLoopState run(String userGoal,
+                              AgentToolRegistry toolRegistry,
+                              AgentTurnClient turnClient,
+                              AgentLoopObserver observer,
                               int maxTurns) {
         return run(userGoal, toolRegistry, turnClient, observer, AgentPermissionContext.readOnly(), maxTurns);
     }
@@ -142,10 +166,37 @@ public class AgentLoopService {
                               AgentLoopObserver observer,
                               AgentPermissionContext permissionContext,
                               int maxTurns) {
-        AgentLoopState state = new AgentLoopState(userGoal);
+        return run(userGoal, toolRegistry, turnClient, observer, permissionContext, maxTurns, null, null);
+    }
+
+    public AgentLoopState run(String userGoal,
+                              AgentToolRegistry toolRegistry,
+                              AgentTurnClient turnClient,
+                              AgentLoopObserver observer,
+                              AgentPermissionContext permissionContext,
+                              int maxTurns,
+                              String resumeFromRunId) {
+        return run(userGoal, toolRegistry, turnClient, observer, permissionContext, maxTurns, resumeFromRunId, null);
+    }
+
+    public AgentLoopState run(String userGoal,
+                              AgentToolRegistry toolRegistry,
+                              AgentTurnClient turnClient,
+                              AgentLoopObserver observer,
+                              AgentPermissionContext permissionContext,
+                              int maxTurns,
+                              String resumeFromRunId,
+                              String runId) {
+        AgentLoopState state = runId != null && !runId.isBlank()
+                ? new AgentLoopState(userGoal, runId)
+                : new AgentLoopState(userGoal);
+        if (resumeFromRunId != null && !resumeFromRunId.isBlank()) {
+            state.setResumeFromRunId(resumeFromRunId);
+        }
+        injectCheckpointContext(state);
         registerTodoTools(toolRegistry, state);
         registerSkillTools(toolRegistry);
-        registerTaskTools(toolRegistry);
+        registerTaskTools(toolRegistry, state);
         AgentLoopObserver safeObserver = observer == null ? AgentLoopObserver.NOOP : observer;
 
         if (maxTurns >= DEFAULT_MAX_TURNS) {
@@ -177,7 +228,11 @@ public class AgentLoopService {
                 continue;
             }
             if (decision.finalAnswer() != null) {
-                state.finish(decision.finalAnswer());
+                String answer = state.citationRegistry().appendReferenceList(decision.finalAnswer());
+                if (selfReviewer != null) {
+                    answer = selfReviewer.review(answer, state, turnClient);
+                }
+                state.finish(answer);
                 break;
             }
 
@@ -200,6 +255,11 @@ public class AgentLoopService {
             ));
             AgentPermissionDecision permissionDecision = permissionGate.check(tool, permissionContext);
             if (!permissionDecision.allowed()) {
+                if (tool.spec().permissionLevel() == AgentToolPermissionLevel.SENSITIVE
+                        && approvalHandler != null
+                        && approvalHandler.askForApproval(tool, toolUse)) {
+                    // User approved — skip deny, proceed to tool execution
+                } else {
                 AgentPermissionDeniedException error = new AgentPermissionDeniedException(
                         "Permission denied for tool " + toolUse.name() + ": " + permissionDecision.reason()
                 );
@@ -219,6 +279,7 @@ public class AgentLoopService {
                 state.transitionReason("tool_result");
                 continue;
             }
+                } // end else — SENSITIVE approval denied or no handler
             // Idempotency check: skip duplicate tool calls within TTL window
             if (idempotencyGuard != null && idempotencyGuard.isDuplicate(toolUse.name(), toolUse.input())) {
                 String cached = idempotencyGuard.getCachedResult(toolUse.name(), toolUse.input());
@@ -234,6 +295,7 @@ public class AgentLoopService {
             try {
                 Object output = executeWithRetry(toolUse, tool, state, safeObserver, toolStartedAt);
                 if (output == null) continue; // retry/semantic recovery already handled
+                output = postProcessKnowledgeResult(toolUse.name(), output, state);
                 long toolLatencyMs = System.currentTimeMillis() - toolStartedAt;
                 safeObserver.onToolResult(state.turnCount(), toolUse.name(), toolUse.input(), output,
                         toolLatencyMs);
@@ -259,6 +321,7 @@ public class AgentLoopService {
                 applyTieredRecovery(state, toolUse, recoveryDecision);
             }
             state.transitionReason("tool_result");
+            checkpoint(state);
         }
 
         return finalizeState(state, maxTurns);
@@ -361,6 +424,15 @@ public class AgentLoopService {
             publishRecoveryHook(state.turnCount(), null, recoveryDecision);
             state.finish(String.valueOf(recoveryDecision.content()));
         }
+        // Keep checkpoint if there are pending items (todos or FileTaskBoard tasks)
+        boolean hasPendingTasks = taskGraphService.list(false, state.runId()).stream()
+                .anyMatch(t -> {
+                    String s = String.valueOf(t.get("status"));
+                    return "PENDING".equals(s) || "IN_PROGRESS".equals(s);
+                });
+        if (state.todos().isEmpty() && !hasPendingTasks) {
+            cleanupCheckpoint(state);
+        }
         return state;
     }
 
@@ -383,9 +455,10 @@ public class AgentLoopService {
                         skillCatalogService.loadSkill(stringArg(input, "name")));
     }
 
-    private void registerTaskTools(AgentToolRegistry toolRegistry) {
+    private void registerTaskTools(AgentToolRegistry toolRegistry, AgentLoopState state) {
+        String runId = state.runId();
         toolRegistry
-                .register("task_create", "Create one persistent task. Input: subject, optional description/owner/blockedBy[].", input -> {
+                .register("task_create", "Create one persistent task. Input: subject, optional description/owner/blockedBy[]. Task is automatically scoped to current run.", input -> {
                     String subject = stringArg(input, "subject");
                     if (subject.isBlank()) {
                         throw new IllegalArgumentException("subject is required for task_create");
@@ -394,7 +467,8 @@ public class AgentLoopService {
                             subject,
                             stringArg(input, "description"),
                             stringArg(input, "owner"),
-                            longListArg(input, "blockedBy")
+                            longListArg(input, "blockedBy"),
+                            runId
                     );
                     return taskToMap(task);
                 })
@@ -416,8 +490,153 @@ public class AgentLoopService {
                     long id = longArg(input, "id");
                     return taskToMap(taskGraphService.get(id));
                 })
-                .register("task_list", "List persistent tasks. Input: optional includeDeleted.", input ->
-                        taskGraphService.list(booleanArg(input, "includeDeleted", false)));
+                .register("task_list", "List persistent tasks. Input: optional includeDeleted and groupId (defaults to current run).", input -> {
+                    String groupId = nullableStringArg(input, "groupId");
+                    if (groupId == null) {
+                        groupId = runId;
+                    }
+                    return taskGraphService.list(booleanArg(input, "includeDeleted", false), groupId);
+                });
+    }
+
+    private void injectCheckpointContext(AgentLoopState state) {
+        if (!taskGraphService.isFileSystemBacked()) {
+            return;
+        }
+        Path taskDir = Path.of(".tasks");
+        if (!Files.exists(taskDir)) {
+            return;
+        }
+        String currentRunId = state.runId();
+        java.util.List<Path> checkpointFiles = new ArrayList<>();
+        try (var stream = Files.list(taskDir)) {
+            checkpointFiles = stream
+                    .filter(p -> p.getFileName().toString().startsWith("checkpoint_"))
+                    .filter(p -> !p.getFileName().toString().contains(currentRunId))
+                    .sorted(Comparator.comparing(Path::toString))
+                    .toList();
+        } catch (IOException e) {
+            return;
+        }
+        if (checkpointFiles.isEmpty()) {
+            return;
+        }
+        Path latest = checkpointFiles.get(checkpointFiles.size() - 1);
+        try {
+            JsonNode cp = objectMapper.readTree(latest.toFile());
+            String prevRunId = cp.has("runId") ? cp.get("runId").asText("") : "";
+            boolean hasPending = false;
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("[Resuming from previous session");
+
+            // Checkpoint context: goal + messages + todos
+            String prevGoal = cp.has("goal") ? cp.get("goal").asText("") : "";
+            int prevTurns = cp.has("turnCount") ? cp.get("turnCount").asInt(0) : 0;
+            if (!prevGoal.isBlank() || prevTurns > 0) {
+                if (!prevGoal.isBlank()) {
+                    sb.append("\nPrevious goal: ").append(truncate(prevGoal, 300));
+                }
+                if (prevTurns > 0) {
+                    sb.append("\nCompleted ").append(prevTurns).append(" turns before interruption");
+                }
+                hasPending = true;
+            }
+            if (cp.has("todos") && cp.get("todos").isArray() && cp.get("todos").size() > 0) {
+                sb.append("\nUnfinished todos:");
+                for (JsonNode todo : cp.get("todos")) {
+                    sb.append("\n- ").append(todo.path("content").asText(""))
+                            .append(" [").append(todo.path("status").asText("PENDING")).append("]");
+                }
+                hasPending = true;
+            }
+
+            // Task data from FileTaskBoard — single source of truth, no redundancy
+            if (!prevRunId.isBlank()) {
+                List<Map<String, Object>> prevTasks = taskGraphService.list(false, prevRunId);
+                if (!prevTasks.isEmpty()) {
+                    sb.append("\nTasks from previous session (groupId: ").append(prevRunId).append("):");
+                    for (Map<String, Object> task : prevTasks) {
+                        String status = String.valueOf(task.get("status"));
+                        sb.append("\n- #").append(task.get("id"))
+                                .append(": ").append(task.get("subject"))
+                                .append(" [").append(status).append("]");
+                        @SuppressWarnings("unchecked")
+                        var blockedBy = (List<Long>) task.get("blockedBy");
+                        if (!blockedBy.isEmpty()) {
+                            sb.append(" (blocked by: ").append(blockedBy).append(")");
+                        }
+                        if ("PENDING".equals(status) || "IN_PROGRESS".equals(status)) {
+                            hasPending = true;
+                        }
+                    }
+                }
+            }
+
+            if (!hasPending) {
+                return;
+            }
+            sb.append("\nUse task_list(groupId='").append(prevRunId)
+                    .append("') to check task details, task_update to modify status.");
+            sb.append("\nContinue working on pending items or mark them COMPLETED/DELETED if no longer relevant.");
+            state.messages().add(new AgentMessage("system", sb.toString()));
+        } catch (IOException e) {
+            // Corrupted checkpoint — skip silently
+        }
+    }
+
+    private void checkpoint(AgentLoopState state) {
+        if (!taskGraphService.isFileSystemBacked()) {
+            return;
+        }
+        try {
+            Path taskDir = Path.of(".tasks");
+            Files.createDirectories(taskDir);
+            var cp = objectMapper.createObjectNode();
+            cp.put("runId", state.runId());
+            cp.put("turnCount", state.turnCount());
+            // Store original goal (first message)
+            if (!state.messages().isEmpty()) {
+                cp.put("goal", state.messages().get(0).content());
+            }
+            // Plan
+            if (state.plan() != null && !state.plan().isEmpty()) {
+                var planArr = objectMapper.createArrayNode();
+                for (PlanStep step : state.plan()) {
+                    var stepNode = objectMapper.createObjectNode();
+                    stepNode.put("action", step.action());
+                    stepNode.put("toolName", step.toolName());
+                    stepNode.put("rationale", step.rationale() == null ? "" : step.rationale());
+                    stepNode.put("order", step.order());
+                    planArr.add(stepNode);
+                }
+                cp.set("plan", planArr);
+            }
+            // Todos
+            cp.set("todos", objectMapper.valueToTree(state.todos()));
+            // Messages (last 20 to keep file small)
+            var msgArr = objectMapper.createArrayNode();
+            List<AgentMessage> msgs = state.messages();
+            int start = Math.max(0, msgs.size() - 20);
+            for (int i = start; i < msgs.size(); i++) {
+                var msgNode = objectMapper.createObjectNode();
+                msgNode.put("role", msgs.get(i).role());
+                msgNode.put("content", truncate(msgs.get(i).content(), 2000));
+                msgArr.add(msgNode);
+            }
+            cp.set("messages", msgArr);
+            objectMapper.writeValue(taskDir.resolve("checkpoint_" + state.runId() + ".json").toFile(), cp);
+        } catch (Exception ignored) {
+            // Checkpoint must never break the main loop
+        }
+    }
+
+    private void cleanupCheckpoint(AgentLoopState state) {
+        try {
+            Path cp = Path.of(".tasks", "checkpoint_" + state.runId() + ".json");
+            Files.deleteIfExists(cp);
+        } catch (IOException ignored) {
+        }
     }
 
     private void drainBackgroundNotifications(AgentLoopState state) {
@@ -787,7 +1006,8 @@ public class AgentLoopService {
                 "blockedBy", List.copyOf(task.getBlockedBy()),
                 "blocks", List.copyOf(task.getBlocks()),
                 "owner", Objects.toString(task.getOwner(), ""),
-                "ready", task.isReady()
+                "ready", task.isReady(),
+                "groupId", task.getGroupId() == null ? "" : task.getGroupId()
         );
     }
 
@@ -798,6 +1018,44 @@ public class AgentLoopService {
         block.put("name", toolUse.name());
         block.put("content", output);
         state.messages().add(new AgentMessage("user", toJson(block)));
+    }
+
+    private Object postProcessKnowledgeResult(String toolName, Object output, AgentLoopState state) {
+        if (!isKnowledgeRetrievalTool(toolName)) {
+            return output;
+        }
+        if (!(output instanceof List<?> list)) {
+            return output;
+        }
+        if (list.isEmpty()) {
+            return output;
+        }
+        if (!(list.get(0) instanceof KnowledgeSnippetView)) {
+            return output;
+        }
+        List<Map<String, Object>> citedResults = new ArrayList<>();
+        for (Object item : list) {
+            KnowledgeSnippetView snippet = (KnowledgeSnippetView) item;
+            int ref = state.citationRegistry().register(
+                    snippet.source(),
+                    snippet.title(),
+                    snippet.section()
+            );
+            Map<String, Object> cited = new LinkedHashMap<>();
+            cited.put("ref", ref);
+            cited.put("source", snippet.source());
+            if (snippet.slug() != null) cited.put("slug", snippet.slug());
+            if (snippet.title() != null) cited.put("title", snippet.title());
+            if (snippet.section() != null) cited.put("section", snippet.section());
+            cited.put("content", snippet.content());
+            citedResults.add(cited);
+        }
+        return citedResults;
+    }
+
+    private boolean isKnowledgeRetrievalTool(String toolName) {
+        return "retrieveKnowledge".equals(toolName)
+                || toolName.toLowerCase().contains("knowledge");
     }
 
     private void applyRecovery(AgentLoopState state, AgentRecoveryDecision recoveryDecision) {

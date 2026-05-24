@@ -12,12 +12,18 @@ public class TaskRecord {
     private List<Long> blockedBy = new ArrayList<>();
     private List<Long> blocks = new ArrayList<>();
     private String owner;
+    private String groupId;
 
     public TaskRecord() {
     }
 
     public TaskRecord(long id, String subject, String description, TaskStatus status, List<Long> blockedBy,
                       List<Long> blocks, String owner) {
+        this(id, subject, description, status, blockedBy, blocks, owner, null);
+    }
+
+    public TaskRecord(long id, String subject, String description, TaskStatus status, List<Long> blockedBy,
+                      List<Long> blocks, String owner, String groupId) {
         this.id = id;
         this.subject = subject;
         this.description = description;
@@ -25,6 +31,7 @@ public class TaskRecord {
         this.blockedBy = blockedBy == null ? new ArrayList<>() : new ArrayList<>(blockedBy);
         this.blocks = blocks == null ? new ArrayList<>() : new ArrayList<>(blocks);
         this.owner = owner;
+        this.groupId = groupId;
     }
 
     public long getId() {
@@ -81,6 +88,14 @@ public class TaskRecord {
 
     public void setOwner(String owner) {
         this.owner = owner;
+    }
+
+    public String getGroupId() {
+        return groupId;
+    }
+
+    public void setGroupId(String groupId) {
+        this.groupId = groupId;
     }
 
     public boolean isReady() {

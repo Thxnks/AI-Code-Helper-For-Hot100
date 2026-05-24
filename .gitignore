@@ -5,6 +5,7 @@ application-local.yml
 .env.*.local
 !.env.example
 data/
+.tasks/
 .claude/
 CLAUDE.md
 compile_output.txt

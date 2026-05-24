@@ -12,8 +12,20 @@ public class TaskGraphService {
         this.taskBoard = taskBoard;
     }
 
+    public boolean isFileSystemBacked() {
+        return taskBoard instanceof FileTaskBoard;
+    }
+
     public TaskRecord create(String subject, String description, String owner, List<Long> blockedBy) {
+        return create(subject, description, owner, blockedBy, null);
+    }
+
+    public TaskRecord create(String subject, String description, String owner, List<Long> blockedBy, String groupId) {
         TaskRecord created = taskBoard.create(subject, description, owner);
+        if (groupId != null) {
+            created.setGroupId(groupId);
+            taskBoard.update(created);
+        }
         for (Long dependencyId : blockedBy == null ? List.<Long>of() : blockedBy) {
             addDependency(dependencyId, created.getId());
         }
@@ -67,18 +79,27 @@ public class TaskGraphService {
     }
 
     public List<Map<String, Object>> list(boolean includeDeleted) {
-        return taskBoard.list(includeDeleted).stream()
-                .map(task -> Map.of(
-                        "id", task.getId(),
-                        "subject", task.getSubject(),
-                        "description", task.getDescription(),
-                        "status", task.getStatus(),
-                        "blockedBy", List.copyOf(task.getBlockedBy()),
-                        "blocks", List.copyOf(task.getBlocks()),
-                        "owner", task.getOwner() == null ? "" : task.getOwner(),
-                        "ready", task.isReady()
-                ))
+        return list(includeDeleted, null);
+    }
+
+    public List<Map<String, Object>> list(boolean includeDeleted, String groupId) {
+        return taskBoard.listByGroup(groupId, includeDeleted).stream()
+                .map(this::taskToMap)
                 .toList();
+    }
+
+    private Map<String, Object> taskToMap(TaskRecord task) {
+        return Map.of(
+                "id", task.getId(),
+                "subject", task.getSubject(),
+                "description", task.getDescription(),
+                "status", task.getStatus(),
+                "blockedBy", List.copyOf(task.getBlockedBy()),
+                "blocks", List.copyOf(task.getBlocks()),
+                "owner", task.getOwner() == null ? "" : task.getOwner(),
+                "ready", task.isReady(),
+                "groupId", task.getGroupId() == null ? "" : task.getGroupId()
+        );
     }
 
     private void resetDependencies(TaskRecord task, List<Long> nextBlockedBy) {

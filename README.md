@@ -180,6 +180,27 @@ Tiers 1 and 2 directly mutate the message list without calling `state.compact()`
 - **Idempotency**: `ToolIdempotencyGuard` hashes tool calls by name and sorted JSON input, stores successful outputs in Redis for 10 minutes, and returns `_idempotent=true` cached results for duplicate calls.
 - **Tiered recovery**: `AgentRecoveryPolicy` classifies errors into `TRANSIENT`, `PARAMETER`, and `SEMANTIC`. Transient errors retry the same call, parameter errors ask the model to fix input/output shape, and semantic errors clear the current plan and emit a replan event.
 
+### Cross-Run Task System and Checkpointing
+
+Complex goals (e.g. "fix all my weak-tag problems") can span multiple runs. The Agent Runtime provides two mechanisms that work together to enable cross-run continuity:
+
+**Task Graph** (`TaskGraphService` + `FileTaskBoard`):
+
+- LLM can break work into `TaskRecord` items with dependency graph (`blockedBy` / `blocks`). Each record has subject, description, status (`PENDING` / `IN_PROGRESS` / `COMPLETED`), owner, and groupId.
+- Task records are persisted to `.tasks/task_N.json` via `FileTaskBoard` — durable across runs and JVM restarts.
+- `task_create`, `task_update`, `task_get`, `task_list` are registered as core Agent tools. Tasks are auto-tagged with the current `runId` as `groupId`, providing per-run isolation.
+- When a task is marked `COMPLETED`, `unlockFollowers` automatically removes the dependency from blocked tasks. The `ready` field tells the model which tasks are unblocked.
+
+**Checkpoint** (conversation state for resumption):
+
+- After every model turn, the current state snapshot is written to `.tasks/checkpoint_{runId}.json`: `runId`, `turnCount`, goal, plan, todos, and the last 20 messages.
+- On the next run start, `injectCheckpointContext` scans for the most recent checkpoint from a different run and injects a structured system message: previous goal, completed turn count, unfinished todos, and pending `TaskRecord` items from `FileTaskBoard`.
+- Cleanup: if a run finishes with all todos completed and no pending tasks, its checkpoint is deleted. Checkpoints with unfinished work persist for the next resume.
+
+**Single source of truth**: `TaskRecord` data lives only in `FileTaskBoard`. The checkpoint stores conversation context (messages, todos, plan) — not task data. When resuming, task data is queried from `FileTaskBoard` by `groupId` (the previous `runId`). This avoids data duplication and keeps recovery logic clear.
+
+**runId alignment**: `AgentTask.taskId` (database record) matches `AgentLoopState.runId` (in-memory) and `TaskRecord.groupId` (file task board), so database traces, checkpoint files, and task records are all linkable.
+
 ## Main APIs
 
 Auth:

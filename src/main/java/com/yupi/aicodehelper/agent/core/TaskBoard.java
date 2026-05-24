@@ -14,4 +14,6 @@ public interface TaskBoard {
     TaskRecord update(TaskRecord taskRecord);
 
     void removeBlockedBy(long blockedTaskId, long dependencyId);
+
+    List<TaskRecord> listByGroup(String groupId, boolean includeDeleted);
 }

@@ -36,6 +36,7 @@ public class AgentPromptBuilder {
                 - After receiving a tool_result, use it to decide the next step.
                 - After receiving a recovery message, correct the previous issue and continue.
                 - Do not call tools that are not listed.
+                - When retrieveKnowledge or any knowledge tool returns results with "ref" numbers, cite sources in your final_answer using [1], [2] format directly in the text. Place citations immediately after the claim they support. Only cite sources you actually used.
                 - Prefer a final_answer once you have enough observations.
 
                 Execution plan:

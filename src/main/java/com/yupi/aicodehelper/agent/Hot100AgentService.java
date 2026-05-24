@@ -248,7 +248,8 @@ public class Hot100AgentService {
                         Boolean.TRUE.equals(context.request().allowWrite()),
                         Boolean.TRUE.equals(context.request().allowExternal()),
                         false
-                )
+                ),
+                context.taskId()
         );
         return state.finalAnswer();
     }

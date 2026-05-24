@@ -51,6 +51,17 @@ public class InMemoryTaskBoard implements TaskBoard {
         blocked.getBlockedBy().remove(dependencyId);
     }
 
+    @Override
+    public synchronized List<TaskRecord> listByGroup(String groupId, boolean includeDeleted) {
+        return records.values().stream()
+                .filter(task -> includeDeleted || task.getStatus() != TaskStatus.DELETED)
+                .filter(task -> groupId == null ? task.getGroupId() == null
+                        : groupId.equals(task.getGroupId()))
+                .sorted(Comparator.comparingLong(TaskRecord::getId))
+                .map(this::copy)
+                .toList();
+    }
+
     private TaskRecord copy(TaskRecord source) {
         return new TaskRecord(
                 source.getId(),

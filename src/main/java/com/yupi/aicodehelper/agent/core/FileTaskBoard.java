@@ -70,6 +70,23 @@ public class FileTaskBoard implements TaskBoard {
         save(blocked);
     }
 
+    @Override
+    public synchronized List<TaskRecord> listByGroup(String groupId, boolean includeDeleted) {
+        ensureDirectory();
+        try (var stream = Files.list(taskDirectory)) {
+            return stream
+                    .filter(path -> path.getFileName().toString().startsWith("task_"))
+                    .sorted(Comparator.comparing(Path::toString))
+                    .map(this::read)
+                    .filter(task -> includeDeleted || task.getStatus() != TaskStatus.DELETED)
+                    .filter(task -> groupId == null ? task.getGroupId() == null
+                            : groupId.equals(task.getGroupId()))
+                    .toList();
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to list task files", e);
+        }
+    }
+
     private long nextId() {
         return list(true).stream()
                 .mapToLong(TaskRecord::getId)

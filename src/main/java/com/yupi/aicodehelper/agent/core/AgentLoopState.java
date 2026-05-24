@@ -2,11 +2,15 @@ package com.yupi.aicodehelper.agent.core;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.UUID;
 
 public class AgentLoopState {
 
     private final List<AgentMessage> messages = new ArrayList<>();
     private final List<TodoItem> todos = new ArrayList<>();
+    private final AgentCitationRegistry citationRegistry = new AgentCitationRegistry();
+    private final String runId;
+    private String resumeFromRunId;
     private AgentCompactSummary compactSummary;
     private int turnCount;
     private String transitionReason;
@@ -15,6 +19,11 @@ public class AgentLoopState {
     private List<PlanStep> plan;
 
     public AgentLoopState(String userMessage) {
+        this(userMessage, UUID.randomUUID().toString().replace("-", ""));
+    }
+
+    public AgentLoopState(String userMessage, String runId) {
+        this.runId = runId;
         this.messages.add(new AgentMessage("user", userMessage));
     }
 
@@ -24,6 +33,10 @@ public class AgentLoopState {
 
     public List<TodoItem> todos() {
         return todos;
+    }
+
+    public AgentCitationRegistry citationRegistry() {
+        return citationRegistry;
     }
 
     public void replaceTodos(List<TodoItem> todos) {
@@ -68,6 +81,18 @@ public class AgentLoopState {
 
     public String finalAnswer() {
         return finalAnswer;
+    }
+
+    public String runId() {
+        return runId;
+    }
+
+    public String resumeFromRunId() {
+        return resumeFromRunId;
+    }
+
+    public void setResumeFromRunId(String resumeFromRunId) {
+        this.resumeFromRunId = resumeFromRunId;
     }
 
     public List<PlanStep> plan() {
