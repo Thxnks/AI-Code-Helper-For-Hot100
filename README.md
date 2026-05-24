@@ -180,7 +180,7 @@ Tiers 1 and 2 directly mutate the message list without calling `state.compact()`
 - **Idempotency**: `ToolIdempotencyGuard` hashes tool calls by name and sorted JSON input, stores successful outputs in Redis for 10 minutes, and returns `_idempotent=true` cached results for duplicate calls.
 - **Tiered recovery**: `AgentRecoveryPolicy` classifies errors into `TRANSIENT`, `PARAMETER`, and `SEMANTIC`. Transient errors retry the same call, parameter errors ask the model to fix input/output shape, and semantic errors clear the current plan and emit a replan event.
 
-### Cross-Run Task System and Checkpointing
+## Cross-Run Task System and Checkpointing
 
 Complex goals (e.g. "fix all my weak-tag problems") can span multiple runs. The Agent Runtime provides two mechanisms that work together to enable cross-run continuity:
 

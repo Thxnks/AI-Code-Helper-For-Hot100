@@ -180,7 +180,7 @@ Agent 事件携带 `type`、`turn`、`toolName`、`data`、`latencyMs`、`status
 - **工具幂等**：`ToolIdempotencyGuard` 按工具名和排序后的 JSON 入参生成哈希，成功结果写入 Redis 10 分钟；重复调用返回 `_idempotent=true` 的缓存结果。
 - **三级恢复**：`AgentRecoveryPolicy` 将错误分为 `TRANSIENT`、`PARAMETER`、`SEMANTIC`。瞬时错误重试原调用，参数错误要求模型修正入参或输出格式，语义错误清空当前计划并触发 replan 事件。
 
-### 跨 Run 任务系统与 Checkpoint
+## 跨 Run 任务系统与 Checkpoint
 
 复杂目标（如"清掉所有薄弱标签题"）需要跨多次 run 才能完成。Agent Runtime 通过两套机制协同实现跨 run 持续推进：
 
