@@ -180,6 +180,27 @@ Agent 事件携带 `type`、`turn`、`toolName`、`data`、`latencyMs`、`status
 - **工具幂等**：`ToolIdempotencyGuard` 按工具名和排序后的 JSON 入参生成哈希，成功结果写入 Redis 10 分钟；重复调用返回 `_idempotent=true` 的缓存结果。
 - **三级恢复**：`AgentRecoveryPolicy` 将错误分为 `TRANSIENT`、`PARAMETER`、`SEMANTIC`。瞬时错误重试原调用，参数错误要求模型修正入参或输出格式，语义错误清空当前计划并触发 replan 事件。
 
+### 跨 Run 任务系统与 Checkpoint
+
+复杂目标（如"清掉所有薄弱标签题"）需要跨多次 run 才能完成。Agent Runtime 通过两套机制协同实现跨 run 持续推进：
+
+**任务图**（`TaskGraphService` + `FileTaskBoard`）：
+
+- LLM 可以将大目标拆分为带依赖图的 `TaskRecord` 项（`blockedBy` / `blocks`）。每条记录包含 subject、description、status（`PENDING` / `IN_PROGRESS` / `COMPLETED`）、owner 和 groupId。
+- 任务记录通过 `FileTaskBoard` 持久化到 `.tasks/task_N.json`——跨 run、跨 JVM 重启不丢失。
+- `task_create`、`task_update`、`task_get`、`task_list` 注册为 Agent 核心工具。任务自动以当前 `runId` 作为 `groupId`，实现 run 级隔离。
+- 任务标记 `COMPLETED` 后，`unlockFollowers` 自动解除被阻塞任务的依赖关系。`ready` 字段告诉模型哪些任务已就绪。
+
+**Checkpoint**（对话状态快照，用于跨 run 恢复上下文）：
+
+- 每轮模型决策后，当前状态快照写入 `.tasks/checkpoint_{runId}.json`：包含 `runId`、`turnCount`、goal、plan、todos 和最近 20 条消息。
+- 下次 run 启动时，`injectCheckpointContext` 自动扫描最近一次非当前 run 的 checkpoint，注入结构化 system message：上次目标、已完成轮数、未完成 todos，以及从 `FileTaskBoard` 查询的未完成 `TaskRecord` 列表。
+- 清理策略：run 正常结束且 todos 和 TaskRecord 均无未完成项时删除 checkpoint；有未完成工作的 checkpoint 保留以供下次 resume。
+
+**单一真相源**：`TaskRecord` 数据只存在于 `FileTaskBoard`。checkpoint 仅存储对话上下文（messages、todos、plan），不存任务数据。resume 时通过 `groupId`（即上次的 `runId`）从 `FileTaskBoard` 查询任务信息。避免数据冗余，恢复逻辑清晰。
+
+**runId 对齐**：`AgentTask.taskId`（数据库记录）、`AgentLoopState.runId`（内存中）和 `TaskRecord.groupId`（文件任务板）三者一致，数据库 trace、checkpoint 文件和任务记录可互相追溯。
+
 ## 核心接口
 
 认证：
